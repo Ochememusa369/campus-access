@@ -1,159 +1,209 @@
+
+"""Storage, validation, ID generation, and JSON persistence for access-card requests."""
+
 import json
-import os
+import re
 
-# Allowed values based on requirements contract
-ALLOWED_CARD_TYPES = {"visitor", "student", "staff"}
-ALLOWED_STATUSES = {"requested", "approved", "issued", "returned"}
+_requests = {}
+_next_id = 1
 
-# In-memory storage dictionary: maps request_id (str) -> request_dict (dict)
-_requests_db = {}
+VALID_CARD_TYPES = {"visitor", "student", "staff"}
+VALID_STATUSES = {"requested", "approved", "issued", "returned"}
+
+REQUIRED_FIELDS = {
+    "id",
+    "fellow_id",
+    "card_type",
+    "status",
+    "approved_by",
+}
+
+ID_PATTERN = re.compile(r"A[0-9]{3,}\Z")
 
 
 def clear_store():
-    """Helper function primarily used by unit tests to clear database state."""
-    global _requests_db
-    _requests_db.clear()
+    """Clear all records. Useful for tests."""
+    global _requests, _next_id
+    _requests = {}
+    _next_id = 1
 
 
-def _validate_ascii_digits(text: str) -> bool:
-    """Ensures characters are strictly ASCII 0-9 (rejects arbitrary Unicode digits)."""
-    if not text:
-        return False
-    for char in text:
-        if char < "0" or char > "9":
-            return False
-    return True
+def _validate_request_id(request_id):
+    """Reject malformed request IDs."""
+    if not isinstance(request_id, str) or not ID_PATTERN.fullmatch(request_id):
+        raise ValueError("Request ID must look like A001.")
+
+    if int(request_id[1:]) < 1:
+        raise ValueError("Request ID must be greater than A000.")
 
 
-def generate_next_id() -> str:
-    """
-    Analyzes existing IDs (e.g., 'A001', 'A002') and generates the next sequence.
-    Handles restarts safely by extracting the maximum numeric counter.
-    """
-    if not _requests_db:
-        return "A001"
-    
-    max_numeric_id = 0
-    for req_id in _requests_db.keys():
-        if len(req_id) >= 4 and req_id.startswith("A"):
-            numeric_part = req_id[1:]
-            if _validate_ascii_digits(numeric_part):
-                max_numeric_id = max(max_numeric_id, int(numeric_part))
-                
-    next_numeric = max_numeric_id + 1
-    return f"A{next_numeric:03d}"
+def _validate_record(record):
+    """Validate a complete request record."""
+    if not isinstance(record, dict):
+        raise ValueError("Each request must be a dictionary.")
 
+    if set(record) != REQUIRED_FIELDS:
+        raise ValueError(
+            "Request must contain exactly: id, fellow_id, card_type, "
+            "status, and approved_by."
+        )
 
-def create_request(fellow_id: str, card_type: str) -> dict:
-    """
-    Validates inputs and registers a new access card request.
-    Raises ValueError if assertions fail. Returns a copy of the new record.
-    """
-    # Defensive validations FIRST
-    if not isinstance(fellow_id, str) or not isinstance(card_type, str):
-        raise ValueError("Inputs must be strings.")
-        
-    sanitized_fellow = fellow_id.strip()
-    sanitized_card = card_type.strip().lower()
-    
-    if not sanitized_fellow:
+    _validate_request_id(record["id"])
+
+    if not isinstance(record["fellow_id"], str) or not record["fellow_id"].strip():
         raise ValueError("Fellow ID cannot be blank.")
-        
-    if sanitized_card not in ALLOWED_CARD_TYPES:
-        raise ValueError(f"Invalid card type. Must be one of: {', '.join(ALLOWED_CARD_TYPES)}")
-        
-    # All validations clear -> Generate ID and write safely
-    next_id = generate_next_id()
-    
-    new_record = {
-        "id": next_id,
-        "fellow_id": sanitized_fellow,
-        "card_type": sanitized_card,
+
+    if record["card_type"] not in VALID_CARD_TYPES:
+        raise ValueError("Invalid card type.")
+
+    if record["status"] not in VALID_STATUSES:
+        raise ValueError("Invalid request status.")
+
+    approver = record["approved_by"]
+    if not isinstance(approver, str):
+        raise ValueError("Approved by must be a string.")
+
+    if record["status"] in {"approved", "issued", "returned"}:
+        if not approver.strip():
+            raise ValueError(
+                "Approved, issued, and returned requests need an approver."
+            )
+
+
+def create_request(fellow_id, card_type):
+    """Create a new request with a unique ID and requested status."""
+    global _next_id
+
+    if not isinstance(fellow_id, str) or not fellow_id.strip():
+        raise ValueError("Fellow ID cannot be blank.")
+
+    if not isinstance(card_type, str):
+        raise ValueError("Card type must be a string.")
+
+    card_type = card_type.strip().lower()
+    if card_type not in VALID_CARD_TYPES:
+        raise ValueError("Card type must be visitor, student, or staff.")
+
+    request_id = f"A{_next_id:03d}"
+
+    record = {
+        "id": request_id,
+        "fellow_id": fellow_id.strip(),
+        "card_type": card_type,
         "status": "requested",
-        "approved_by": ""
+        "approved_by": "",
     }
-    
-    _requests_db[next_id] = new_record
-    return new_record.copy()
+
+    _requests[request_id] = record
+    _next_id += 1
+
+    return record.copy()
 
 
-def get_request(request_id: str) -> dict:
-    """
-    Looks up a single request by its string ID.
-    Returns a copy to prevent unauthorized/accidental mutations outside validation rules.
-    """
-    if request_id not in _requests_db:
-        raise KeyError(f"Request ID '{request_id}' not found.")
-    return _requests_db[request_id].copy()
+def get_request(request_id):
+    """Return one request without exposing the stored dictionary."""
+    _validate_request_id(request_id)
+
+    if request_id not in _requests:
+        raise KeyError(f"Request {request_id} was not found.")
+
+    return _requests[request_id].copy()
 
 
-def update_request_internally(request_id: str, updated_record: dict):
-    """
-    Allows Engineer B's workflow module to write validated status mutations back 
-    to storage. It validates the shape before overwriting memory.
-    """
-    if request_id not in _requests_db:
-        raise KeyError("Cannot update a non-existent record.")
-    
-    # Internal deep structural verification
-    if updated_record.get("status") not in ALLOWED_STATUSES:
-        raise ValueError("Invalid target status.")
-        
-    _requests_db[request_id] = updated_record.copy()
+def list_all_requests():
+    """Return copies of all requests."""
+    return [record.copy() for record in _requests.values()]
 
 
-def list_all_requests() -> list:
-    """Returns a list of all current tracking records."""
-    return [record.copy() for record in _requests_db.values()]
+def update_request_internally(request_id, record):
+    """Apply one valid workflow transition to an existing request."""
+    _validate_request_id(request_id)
+
+    if request_id not in _requests:
+        raise KeyError(f"Request {request_id} was not found.")
+
+    _validate_record(record)
+
+    current = _requests[request_id]
+
+    if record["id"] != request_id:
+        raise ValueError("Request ID cannot be changed.")
+
+    if record["fellow_id"] != current["fellow_id"]:
+        raise ValueError("Fellow ID cannot be changed.")
+
+    if record["card_type"] != current["card_type"]:
+        raise ValueError("Card type cannot be changed.")
+
+    allowed_transitions = {
+        "requested": "approved",
+        "approved": "issued",
+        "issued": "returned",
+    }
+
+    old_status = current["status"]
+    new_status = record["status"]
+
+    if new_status == old_status:
+        if record["approved_by"] != current["approved_by"]:
+            raise ValueError("Approver cannot be changed without a status transition.")
+        raise RuntimeError("The request has not made a valid status transition.")
+
+    if allowed_transitions.get(old_status) != new_status:
+        raise RuntimeError(
+            f"Cannot change request status from {old_status} to {new_status}."
+        )
+
+    if new_status == "approved":
+        if not record["approved_by"].strip():
+            raise ValueError("An approver is required.")
+
+    elif record["approved_by"] != current["approved_by"]:
+        raise ValueError("Approver cannot be changed during this transition.")
+
+    # Update only after all validation succeeds.
+    _requests[request_id] = record.copy()
 
 
-def save_requests(filepath: str):
-    """Serializes the current database directly into a targeted JSON file securely."""
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(_requests_db, f, indent=4)
+def save_requests(filename):
+    """Save requests as JSON."""
+    data = list_all_requests()
+
+    with open(filename, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
 
 
-def load_requests(filepath: str):
-    """
-    Loads JSON from disk. Performs structural and data sanity analysis.
-    If validation fails, rejects completely and keeps old memory intact.
-    """
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Target data store file '{filepath}' does not exist.")
-        
-    with open(filepath, "r", encoding="utf-8") as f:
-        raw_content = f.read().strip()
-        if not raw_content:
-            raise ValueError("Malformed JSON: Data file is entirely empty.")
-            
+def load_requests(filename):
+    """Load and validate JSON without replacing existing data on failure."""
+    global _requests, _next_id
+
+    with open(filename, "r", encoding="utf-8") as file:
         try:
-            loaded_data = json.loads(raw_content)
-        except json.JSONDecodeError as err:
-            raise ValueError(f"Malformed JSON layout: {err}")
-            
-    if not isinstance(loaded_data, dict):
-        raise ValueError("Invalid database structural shape. Root must be an object.")
-        
-    # Temporary staging dict to run full file validation before mutating live state
-    temp_db = {}
-    
-    for req_id, record in loaded_data.items():
-        # Validate ID formatting keys
-        if not req_id.startswith("A") or not _validate_ascii_digits(req_id[1:]):
-            raise ValueError(f"Malformed ID key detected in source file: {req_id}")
-            
-        required_keys = {"id", "fellow_id", "card_type", "status", "approved_by"}
-        if not required_keys.issubset(record.keys()):
-            raise ValueError(f"Record {req_id} is missing mandatory information structural keys.")
-            
-        if record["card_type"] not in ALLOWED_CARD_TYPES:
-            raise ValueError(f"Record {req_id} contains an illegal card_type attribute.")
-            
-        if record["status"] not in ALLOWED_STATUSES:
-            raise ValueError(f"Record {req_id} contains an illegal state assignment.")
-            
-        temp_db[req_id] = record
-        
-    # Atomic Swap: File checks passed smoothly, overwrite real runtime dataset securely
-    global _requests_db
-    _requests_db = temp_db
+            data = json.load(file)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in {filename}: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise ValueError("The JSON database must contain a list of requests.")
+
+    # Validate everything in temporary storage before changing the live store.
+    loaded_requests = {}
+
+    for record in data:
+        _validate_record(record)
+        request_id = record["id"]
+
+        if request_id in loaded_requests:
+            raise ValueError(f"Duplicate request ID: {request_id}")
+
+        # Store a copy so callers cannot mutate the database through a reference.
+        loaded_requests[request_id] = record.copy()
+
+    highest_id = max(
+        (int(request_id[1:]) for request_id in loaded_requests),
+        default=0,
+    )
+
+    # Replace live data only after the entire file has passed validation.
+    _requests = loaded_requests
+    _next_id = highest_id + 1
